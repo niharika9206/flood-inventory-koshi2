@@ -1,0 +1,236 @@
+// ============================================================
+// FLOOD INVENTORY — 2021 Koshi Terai
+// Frozen workflow applied — only dates change from 2017
+// Validation: Sentinel-2 visual + UNOSAT (pending simplified upload)
+// ============================================================
+
+Map.setOptions('SATELLITE');
+
+var roi = ee.Geometry.Rectangle([86.5, 26.3, 87.6, 27.0]);
+Map.centerObject(roi, 9);
+Map.addLayer(roi, {color: 'FFFF00', fillColor: '00000000'}, 'ROI');
+
+// ── FROZEN PARAMETERS — identical to 2017 ────────────────────
+// ONLY THESE TWO LINES CHANGE FROM THE 2017 SCRIPT:
+var PRE_START  = '2021-01-01';
+var PRE_END    = '2021-06-15';
+var POST_START = '2021-07-01';
+var POST_END   = '2021-09-30';
+
+print('Event: 2021 Koshi Terai Flood');
+print('Pre:  ' + PRE_START + ' to ' + PRE_END);
+print('Post: ' + POST_START + ' to ' + POST_END);
+
+
+// ── TERRAIN AND WATER MASKS (unchanged) ──────────────────────
+var glo30 = ee.ImageCollection('COPERNICUS/DEM/GLO30')
+  .filterBounds(roi).select('DEM').mosaic().clip(roi);
+var elevMask = glo30.lt(200);
+
+var permWater = ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+  .select('seasonality').gte(10);
+
+
+// ── S1 COLLECTION (unchanged) ────────────────────────────────
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+print('Pre-flood S1 images:', s1.filterDate(PRE_START, PRE_END).size());
+print('Post-flood S1 images:', s1.filterDate(POST_START, POST_END).size());
+
+
+// ── PREPROCESSING (unchanged) ────────────────────────────────
+function normaliseAngle(image) {
+  var angle  = image.select('angle').unmask(30);
+  var cosObs = angle.multiply(Math.PI / 180).cos();
+  var cosRef = ee.Number(30 * Math.PI / 180).cos();
+  var cf     = cosObs.pow(2).divide(cosRef.multiply(cosRef));
+  var vh = ee.Image(10).pow(image.select('VH').divide(10))
+    .divide(cf).max(1e-10).log10().multiply(10).rename('VH_norm');
+  var vv = ee.Image(10).pow(image.select('VV').divide(10))
+    .divide(cf).max(1e-10).log10().multiply(10).rename('VV_norm');
+  return image.addBands(vh, null, true).addBands(vv, null, true)
+    .copyProperties(image, ['system:time_start']);
+}
+
+function leeFilter(image, band) {
+  var b  = image.select(band);
+  var li = ee.Image(10).pow(b.divide(10));
+  var m  = li.reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1.5));
+  var sm = li.pow(2).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1.5));
+  var v  = sm.subtract(m.pow(2)).max(0);
+  var w  = v.subtract(m.pow(2).divide(4.9))
+             .divide(v.add(m.pow(2).divide(4.9)).max(1e-10)).max(0).min(1);
+  return m.add(w.multiply(li.subtract(m)))
+    .max(1e-10).log10().multiply(10).rename(band + '_lee');
+}
+
+function applyLee(image) {
+  return image
+    .addBands(leeFilter(image, 'VH_norm'), null, true)
+    .addBands(leeFilter(image, 'VV_norm'), null, true)
+    .copyProperties(image, ['system:time_start']);
+}
+
+var s1f = s1.map(normaliseAngle).map(applyLee);
+
+
+// ── COMPOSITES (dates changed above, everything else unchanged) ─
+var pre  = s1f.filterDate(PRE_START, PRE_END).median().clip(roi);
+var post = s1f.filterDate(POST_START, POST_END).median().clip(roi);
+
+var sarViz = {min: -22, max: -5, palette: ['black','white']};
+Map.addLayer(pre.select('VH_norm_lee'),  sarViz, 'PRE-flood VH 2021',  false);
+Map.addLayer(post.select('VH_norm_lee'), sarViz, 'POST-flood VH 2021', false);
+
+
+// ── CHANGE IMAGES (unchanged) ────────────────────────────────
+var change_VH = post.select('VH_norm_lee')
+  .subtract(pre.select('VH_norm_lee')).rename('change_VH');
+var change_VV = post.select('VV_norm_lee')
+  .subtract(pre.select('VV_norm_lee')).rename('change_VV');
+
+Map.addLayer(change_VH,
+  {min:-10, max:5, palette:['blue','white','red']},
+  'Change VH 2021 (blue=flood candidate)');
+
+
+// ── OTSU THRESHOLDING (unchanged — recalculates for 2021) ────
+function otsuThreshold(changeImg, bandName) {
+  var neg = changeImg.updateMask(changeImg.lt(0));
+  var h   = ee.Dictionary(neg.reduceRegion({
+    reducer: ee.Reducer.histogram(200, 0.1),
+    geometry: roi, scale: 30, maxPixels: 1e9, bestEffort: true
+  }).get(bandName));
+  var counts = ee.List(h.get('histogram'));
+  var means  = ee.List(h.get('bucketMeans'));
+  var size   = counts.size();
+  var total  = ee.Number(counts.reduce(ee.Reducer.sum()));
+  var wSum   = ee.Number(counts.zip(means).map(function(p) {
+    p = ee.List(p);
+    return ee.Number(p.get(0)).multiply(ee.Number(p.get(1)));
+  }).reduce(ee.Reducer.sum()));
+  var res = ee.List.sequence(0, size.subtract(2)).iterate(function(t, acc) {
+    acc = ee.Dictionary(acc); t = ee.Number(t);
+    var cb=ee.List(acc.get('cb')); var sb=ee.Number(acc.get('sb'));
+    var bB=ee.Number(acc.get('bB')); var bT=ee.Number(acc.get('bT'));
+    var cc=ee.Number(counts.get(t)); var cm=ee.Number(means.get(t));
+    var ncb=cb.add(cc); var nsb=sb.add(cc.multiply(cm));
+    var wA=ee.Number(ncb.reduce(ee.Reducer.sum()));
+    var muA=nsb.divide(wA); var wB=total.subtract(wA);
+    var muB=wSum.subtract(nsb).divide(wB);
+    var bcv=wA.multiply(wB).multiply(muA.subtract(muB).pow(2));
+    return ee.Dictionary({ cb:ncb, sb:nsb,
+      bB: ee.Number(ee.Algorithms.If(bcv.gt(bB), bcv, bB)),
+      bT: ee.Number(ee.Algorithms.If(bcv.gt(bB), cm, bT)) });
+  }, ee.Dictionary({cb:ee.List([]), sb:ee.Number(0),
+    bB:ee.Number(-1), bT:ee.Number(0)}));
+  return ee.Number(ee.Dictionary(res).get('bT'));
+}
+
+var thresh_VH = otsuThreshold(change_VH, 'change_VH');
+var thresh_VV = otsuThreshold(change_VV, 'change_VV');
+print('VH Otsu threshold (dB):', thresh_VH);
+print('VV Otsu threshold (dB):', thresh_VV);
+
+
+// ── FLOOD MASK (unchanged) ────────────────────────────────────
+var flood_raw = change_VH.lt(thresh_VH)
+  .or(change_VV.lt(thresh_VV)).rename('flood');
+
+var flood_masked = flood_raw
+  .multiply(permWater.not())
+  .multiply(elevMask)
+  .rename('flood');
+
+var conn = flood_masked.connectedPixelCount({maxSize: 100, eightConnected: true});
+var flood_clean = flood_masked
+  .updateMask(conn.gte(4)).unmask(0)
+  .multiply(elevMask)
+  .rename('flood').toInt();
+
+Map.addLayer(flood_masked.selfMask(),
+  {palette: ['FF6600']}, 'After masks — before cleaning (orange)');
+Map.addLayer(flood_clean.selfMask(),
+  {palette: ['FF00FF']}, 'FINAL flood map 2021 (magenta)');
+
+
+// ── AREA (unchanged) ─────────────────────────────────────────
+function printArea(img, label) {
+  var a = img.toFloat().multiply(ee.Image.pixelArea())
+    .reduceRegion({reducer: ee.Reducer.sum(), geometry: roi,
+                   scale: 100, maxPixels: 1e10, bestEffort: true});
+  print(label + ' (km²):',
+    ee.Number(a.get('flood')).divide(1e6).round());
+}
+print('── AREA BREAKDOWN ──');
+printArea(flood_raw,     '1. Otsu raw union');
+printArea(flood_masked,  '2. After JRC + elevation masks');
+printArea(flood_clean,   '3. FINAL after noise filter');
+
+
+// ── SENTINEL-2 VALIDATION — FIXED ────────────────────────────
+// Problem: loading least-cloudy image sorted to Sep 26 (post-flood)
+// Fix: restrict to Aug 1-20 window when flood was actually present
+// Aug 7 image confirmed available — this will load it specifically
+
+var s2_flood = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate('2021-07-20', '2021-08-20')  // narrow window during flood peak
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))  // looser cloud filter
+  .sort('CLOUDY_PIXEL_PERCENTAGE');        // least cloudy within flood period
+
+print('S2 flood-period images (Jul 20–Aug 20):', s2_flood.size());
+print('S2 dates in flood period:', s2_flood.aggregate_array('system:time_start')
+  .map(function(t){ return ee.Date(t).format('YYYY-MM-dd'); }));
+
+var s2best = s2_flood.first().clip(roi);
+
+// True colour — should show brown turbid water in Koshi corridor
+Map.addLayer(s2best,
+  {bands: ['B4','B3','B2'], min: 0, max: 3000},
+  'S2 True Colour — Aug 2021 (flood period)');
+
+// NDWI — water appears blue/positive
+var ndwi = s2best.normalizedDifference(['B3','B8']).rename('NDWI');
+Map.addLayer(ndwi,
+  {min: -0.3, max: 0.5, palette: ['white','lightblue','blue']},
+  'NDWI Aug 2021 (blue = water)');
+
+// Water mask from S2
+var s2water = ndwi.gt(0.1);
+Map.addLayer(s2water.selfMask(),
+  {palette: ['0000FF']}, 'S2 water pixels NDWI > 0.1 (blue)');
+
+// Agreement between your flood mask and S2 water
+var overlap = flood_clean.eq(1).and(s2water.eq(1));
+Map.addLayer(overlap.selfMask(),
+  {palette: ['00FF00']}, 'Agreement: SAR + S2 water (green)');
+
+// Also show your flood mask clearly on top
+Map.addLayer(flood_clean.selfMask(),
+  {palette: ['FF00FF']}, 'FINAL flood map 2021 (magenta)');
+
+// Cloud mask check — print cloud % of the loaded image
+var cloudPct = ee.Number(s2best.get('CLOUDY_PIXEL_PERCENTAGE'));
+print('Cloud cover of loaded S2 image (%):', cloudPct);
+print('Acquisition date:', ee.Date(s2best.get('system:time_start'))
+  .format('YYYY-MM-dd'));
+  // ── EXPORT TO GOOGLE DRIVE ───────────────────────────────────
+// This sends the final magenta layer to your "Tasks" tab.
+Export.image.toDrive({
+  image: flood_clean,
+  description: 'Koshi_Terai_Flood_Map_2021',
+  folder: 'GEE_Flood_Mapping', // Optional: saves into a specific Drive folder
+  scale: 30,                   // Matches Sentinel-1/Otsu native resolution
+  region: roi,                 // Clips exactly to your bounding box
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    cloudOptimized: true       // Makes the file easier to load in QGIS/ArcGIS
+  }
+});
